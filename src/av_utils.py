@@ -64,7 +64,10 @@ async def _av_info(url, http_headers=''):
         os.kill(ff_proc.pid, signal.SIGKILL)
         print(e)
         return {}
-    info = json.loads(out)
+    try:
+        info = json.loads(out)
+    except:
+        return {}
     if 'format' in info and 'duration' in info['format']:
         info['format']['duration'] = int(float(info['format']['duration']))
     return info

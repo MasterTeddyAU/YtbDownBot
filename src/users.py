@@ -108,6 +108,16 @@ client = Cloudant(os.environ['CLOUDANT_USERNAME'],
 db = client['ytbdownbot']
 
 
+async def is_user_sane(id):
+    user_id = 'user' + str(id)
+    user_settings = await get_user_no_read(user_id)
+    if user_settings is not None:
+        if user_settings.get('banned', 0) == 1:
+            return False
+
+    return True
+
+
 async def get_user_no_read(id):
     try:
         ch_feed = await get_changes(id)

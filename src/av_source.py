@@ -299,8 +299,10 @@ class URLav(DumbReader):
     @staticmethod
     async def _create(url, headers=None):
         u = URLav()
-        timeout = ClientTimeout(total=3600)
-        u.session = await ClientSession(timeout=timeout, connector=TCPConnector(verify_ssl=False)).__aenter__()
+        u.session = await ClientSession(timeout=ClientTimeout(total=10800,
+                                                              connect=240,
+                                                              sock_connect=200,
+                                                              sock_read=600), connector=TCPConnector(verify_ssl=False)).__aenter__()
         u.request = await u.session.get(url, headers=headers)
         # u.request = await asks.get(url, headers=headers, stream=True, max_redirects=5)
         # u.body = u.request.body(timeout=14400)
@@ -374,6 +376,5 @@ async def _video_screenshot(url, headers=None, screen_time=None, quality=5):
         out = await asyncio.wait_for(proc.stdout.read(), timeout=360)
     except asyncio.TimeoutError as e:
         os.kill(proc.pid, signal.SIGKILL)
-        print(e)
-        return b'\0'
+        raise e
     return out

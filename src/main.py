@@ -261,6 +261,7 @@ is_ytb_link_re = re.compile(
     '^((?:https?:)?\/\/)?((?:www|m|music)\.)?((?:youtube\.com|youtu.be))(\/(?:[\w\-]+\?v=|embed\/|v\/)?)([\w\-]+)(\S+)?$')
 get_ytb_id_re = re.compile(
     '.*(youtu.be\/|v\/|embed\/|watch\?|youtube.com\/user\/[^#]*#([^\/]*?\/)*)\??v?=?([^#\&\?]*).*')
+invidious_re = re.compile(r'https?://(?:www\.)?invidious\.snopyta\.org/watch\?v=(?P<id>[0-9A-Za-z_-]{11})')
 
 single_time_re = re.compile(' ((2[0-3]|[01]?[0-9]):)?(([0-5]?[0-9]):)?([0-5]?[0-9])(\\.[0-9]+)? ')
 
@@ -296,15 +297,13 @@ def normalize_url_path(url):
     return urlunparse(parsed)
 
 
-def youtube_to_invidio(url, audio=False, quality='dash'):
+def youtube_to_invidio(url, quality='dash'):
     u = None
     if is_ytb_link_re.search(url):
         ytb_id_match = get_ytb_id_re.search(url)
         if ytb_id_match:
             ytb_id = ytb_id_match.groups()[-1]
-            u = "https://invidio.us/watch?v=" + ytb_id + f"&quality={quality}"
-            if audio:
-                u += '&listen=1'
+            u = "https://invidious.snopyta.org/watch?v=" + ytb_id + f"&quality={quality}"
     return u
 
 async def upload_multipart_zip(source, name, file_size, chat_id, msg_id):
@@ -348,17 +347,18 @@ async def upload_multipart_zip(source, name, file_size, chat_id, msg_id):
             await source.close()
         else:
             source.close()
-#
-# async def ytb_playlist_to_invidious(url, range):
-#     invid_urls = []
-#     playlist_id_r = re.compile(r'list=((?:PL|LL|EC|UU|FL|RD|UL|TL|PU|OLAK5uy_)[0-9A-Za-z-_]{10,})')
-#     pid = playlist_id_r.search(url).groups()[0]
-#     async with ClientSession() as session:
-#         async with session.get("https://invidio.us/api/v1/playlists/"+pid) as req:
-#             invid_playlist = await req.json()
-#     for iv in invid_playlist['videos'][range[0]-1:range[1]]:
-#         invid_urls.append("https://invidio.us/watch?v=" + iv['videoId'] + "&quality=dash")
-#     return invid_urls
+
+            
+async def ytb_playlist_to_invidious(url, range, quality="dash"):
+    invid_urls = []
+    playlist_id_r = re.compile(r'list=((?:PL|LL|EC|UU|FL|RD|UL|TL|PU|OLAK5uy_)[0-9A-Za-z-_]{10,})')
+    pid = playlist_id_r.search(url).groups()[0]
+    async with ClientSession() as session:
+        async with session.get("https://invidious.snopyta.org/api/v1/playlists/"+pid) as req:
+            invid_playlist = await req.json()
+    for iv in invid_playlist['videos'][range[0]-1:range[1]]:
+        invid_urls.append("https://invidious.snopyta.org/watch?v=" + iv['videoId'] + "&quality="+quality+("&raw=1" if quality != "dash" else ""))
+    return invid_urls
 
 
 def get_cookie_from_text(msg_txt):
@@ -380,6 +380,7 @@ def get_user_prefs_from_text(msg_txt):
 
 async def _on_message(message, log, is_group):
     global STORAGE_SIZE
+    global YT_TOO_MANY_REQUEST
     if message['from']['is_bot']:
         log.info('Message from bot, skip')
         return
@@ -439,7 +440,12 @@ async def _on_message(message, log, is_group):
         elif cmd == 'settings':
             if is_group:
                 await client.send_message(chat_id,
-                                          'Command not available in chats',
+                                          'Settings for groups/channels can be changed only by @pony0boy\n'
+                                          'Ask him if you want:\n'
+                                          '- Disable links in caption\n'
+                                          '- Enable reply to messages\n'
+                                          '- Disable caption\n'
+                                          'Its cost 2$ per group/channel',
                                           reply_to=msg_id)
                 return
             user = await users.User.init(chat_id, is_group=is_group)
@@ -543,6 +549,10 @@ async def _on_message(message, log, is_group):
     if user is None:
         if is_group:
             group_username = message['chat']['username']
+            _from_id = message['from']['id']
+            is_user_sane = await users.is_user_sane(_from_id)
+            if not is_user_sane:
+                raise Exception('Bad user')
         else:
             group_username = None
         user = await users.User.init(chat_id, username=group_username, is_group=is_group)
@@ -567,9 +577,15 @@ async def _on_message(message, log, is_group):
 
     # await _bot.send_chat_action(chat_id, "upload_document")
 
-    # if len(urls) == 1 and 'youtube.com/playlist?list=' in urls[0] and playlist_start is not None:
-    #     urls = await ytb_playlist_to_invidious(urls[0], (playlist_start,playlist_end))
-    if not is_group:
+    if YT_TOO_MANY_REQUEST and 'youtube.com/playlist?list=' in urls[0] and playlist_start is not None:
+        try:
+            if audio_mode:
+                urls = await ytb_playlist_to_invidious(urls[0], (playlist_start,playlist_end))
+            else:
+                urls = await ytb_playlist_to_invidious(urls[0], (playlist_start, playlist_end), quality='hd720')
+        except:
+            pass
+    if not is_group or user.settings.get('nonprivate_action', 0):
         action = await client.action(chat_id, "file").__aenter__()
     try:
         urls = set(urls)
@@ -579,10 +595,10 @@ async def _on_message(message, log, is_group):
                       'youtube_include_dash_manifest': False,
                       'is_group': True,
                       'no_color': True,
-                      'nocheckcertificate': True
-                      # 'force_generic_extractor': True if 'invidio.us/watch' in u else False
+                      'nocheckcertificate': True,
+                      'force_generic_extractor': True if invidious_re.search(u) else False
                       }
-            if playlist_start != None and playlist_end != None: #and 'invidio.us/watch' not in u:
+            if playlist_start != None and playlist_end != None: #and 'invidious.snopyta.org/watch' not in u:
                 params['ignoreerrors'] = True
                 if playlist_start == 0 and playlist_end == 0:
                     params['playliststart'] = 1
@@ -606,29 +622,38 @@ async def _on_message(message, log, is_group):
                         params['playliststart'] += recover_playlist_index
                     ydl.params = params
                     if vinfo is None:
-                        for _ in range(2):
+                        for i_ in range(2):
                             try:
-                                # use invidio.us for youtube links from groups to prevent 429 err
-                                if is_group and ('youtube.com' in u or 'youtu.be' in u):
-                                    invid_url = youtube_to_invidio(u, audio_mode == True, quality='hd720')
-                                    u = invid_url
+                                # use invidious.snopyta.org for youtube links from groups to prevent 429 err
+                                if is_group and invidious_re.search(u):
+                                    if audio_mode:
+                                        u = youtube_to_invidio(u)
+                                    else:
+                                        u = youtube_to_invidio(u, quality='hd720')
                                     ydl.params['force_generic_extractor'] = True
                                 vinfo = await extract_url_info(ydl, u)
-                                if is_group and 'invidio.us' in u:
+                                if is_group and invidious_re.search(u):
                                     try:
-                                        vinfo['entries'][0]['url'] = u + '&raw=1'
+                                        vinfo['entries'][0]['url'] = u + ('&raw=1' if not audio_mode else '')
                                     except:
                                         pass
                                 if vinfo.get('age_limit') == 18 and is_ytb_link_re.search(vinfo.get('webpage_url', '')):
                                     raise youtube_dl.DownloadError('youtube age limit')
                             except youtube_dl.DownloadError as e:
-                                # try to use invidio.us youtube frontend to bypass 429 block
+                                # try to use invidious.snopyta.org youtube frontend to bypass 429 block
                                 if (e.exc_info is not None and e.exc_info[0] is HTTPError and e.exc_info[
                                     1].file.code == 429) or \
                                         'video available in your country' in str(e) or \
                                         'youtube age limit' == str(e):
-                                    invid_url = youtube_to_invidio(u, audio_mode == True)
+                                    if i_ == 1:
+                                        raise
+                                    if audio_mode:
+                                        invid_url = youtube_to_invidio(u)
+                                    else:
+                                        invid_url = youtube_to_invidio(u, quality='hd720&raw=1')
                                     if invid_url:
+                                        if e.exc_info[1].file.code == 429:
+                                            YT_TOO_MANY_REQUEST = True
                                         u = invid_url
                                         ydl.params['force_generic_extractor'] = True
                                         continue
@@ -643,10 +668,12 @@ async def _on_message(message, log, is_group):
                                         if 'tiktok.com/@' not in u:
                                             u = e.exc_info[1].url
                                         vinfo = await extract_url_info(ydl, u)
-                                    elif pn.suitable(u):
+                                    elif pn.suitable(u) or (len(e.exc_info) > 1 and pn.suitable(e.exc_info[1].url)):
                                         # Pinterest inject
                                         ydl.add_info_extractor(pn)
                                         ydl._ies = [PinterestIE] + ydl._ies
+                                        if 'pin.it' in u:
+                                            u = e.exc_info[1].url
                                         vinfo = await extract_url_info(ydl, u)
                                     else:
                                         raise
@@ -681,7 +708,7 @@ async def _on_message(message, log, is_group):
                         log.debug('video info reprocessed with new format')
                 except Exception as e:
                     if "Please log in or sign up to view this video" in str(e):
-                        if 'vk.com' in u:
+                        if 'vk.com' in u and 'username' not in params:
                             params['username'] = os.environ['VIDEO_ACCOUNT_USERNAME']
                             params['password'] = os.environ['VIDEO_ACCOUNT_PASSWORD']
                             ydl = youtube_dl.YoutubeDL(params=params)
@@ -690,30 +717,24 @@ async def _on_message(message, log, is_group):
                             except Exception as e:
                                 log.error(e)
                                 if not is_group:
-                                    await client.send_message(chat_id, str(e), reply_to=msg_id)
-                                continue
-                        else:
-                            log.error(e)
-                            if not is_group:
-                                await client.send_message(chat_id, str(e), reply_to=msg_id)
-                            continue
-                    elif 'are video-only' in str(e):
-                        params['format'] = 'bestvideo[ext=mp4]'
+                                    await client.send_message(chat_id, "ERROR: " + str(e), reply_to=msg_id)
+                                break
+                    if 'are video-only' in str(e):
+                        params['format'] = 'bestvideo[ext=mp4]/bestvideo'
                         ydl = youtube_dl.YoutubeDL(params=params)
                         try:
                             vinfo = await extract_url_info(ydl, u)
                         except Exception as e:
                             log.error(e)
                             if not is_group:
-                                await client.send_message(chat_id, str(e), reply_to=msg_id)
-                            continue
-                    else:
-                        if iu < len(urls) - 1:
-                            log.error(e)
-                            if not is_group:
-                                await client.send_message(chat_id, str(e), reply_to=msg_id)
+                                await client.send_message(chat_id, "ERROR: " + str(e), reply_to=msg_id)
                             break
-
+                    if iu < len(urls) - 1:
+                        log.error(e)
+                        if not is_group:
+                            await client.send_message(chat_id, "ERROR: " + str(e), reply_to=msg_id)
+                        break
+                    if not vinfo:
                         raise
 
                 entries = None
@@ -743,21 +764,17 @@ async def _on_message(message, log, is_group):
                     if not entry.get('direct', False):
                         http_headers['Referer'] = u
 
+                    http_headers['Connection'] = 'keep-alive'
+
                     if user_cookie:
                         http_headers['Cookie'] = user_cookie
-                    elif len(ydl.cookiejar) > 0:
-                        http_headers.setdefault('Cookie', "")
-                        for i, cookie in enumerate(ydl.cookiejar):
-                            http_headers['Cookie'] += cookie.name + "=" + cookie.value
-                            if i != len(ydl.cookiejar) - 1:
-                                http_headers['Cookie'] += "; "
                     _title = entry.get('title', '')
                     if _title == '':
                         entry['title'] = str(msg_id)
 
                     if cmd == 's':
                         direct_url = entry.get('url') if formats is None else formats[0].get('url')
-                        if 'invidio.us' in direct_url:
+                        if 'invidious.snopyta.org' in direct_url:
                             direct_url = normalize_url_path(direct_url)
 
                         await send_screenshot(chat_id,
@@ -791,7 +808,7 @@ async def _on_message(message, log, is_group):
                                     else:
                                         try:
                                             direct_url = f['url']
-                                            if 'invidio.us' in direct_url:
+                                            if 'invidious.snopyta.org' in direct_url:
                                                 direct_url = normalize_url_path(direct_url)
                                             _file_size = await av_utils.media_size(direct_url, http_headers=http_headers)
                                         except Exception as e:
@@ -809,7 +826,7 @@ async def _on_message(message, log, is_group):
                                     vsize = 0
 
                                     direct_url = vformat['url']
-                                    if 'invidio.us' in direct_url:
+                                    if 'invidious.snopyta.org' in direct_url:
                                         vformat['url'] = normalize_url_path(direct_url)
 
                                     if 'filesize' in vformat and vformat['filesize'] != 0 and vformat[
@@ -824,7 +841,7 @@ async def _on_message(message, log, is_group):
                                         mformat = formats[i + 1]
 
                                         direct_url = mformat['url']
-                                        if 'invidio.us' in direct_url:
+                                        if 'invidious.snopyta.org' in direct_url:
                                             mformat['url'] = normalize_url_path(direct_url)
 
                                         if 'filesize' in mformat and mformat['filesize'] != 0 and mformat[
@@ -887,7 +904,7 @@ async def _on_message(message, log, is_group):
                                     chosen_format = f
 
                                     direct_url = chosen_format['url']
-                                    if 'invidio.us' in direct_url:
+                                    if 'invidious.snopyta.org' in direct_url:
                                         chosen_format['url'] = normalize_url_path(direct_url)
 
                                     if audio_mode == True and not (chosen_format['ext'] == 'mp3'):
@@ -917,7 +934,7 @@ async def _on_message(message, log, is_group):
                                     _file_size = entry['filesize']
                                 else:
                                     direct_url = entry['url']
-                                    if 'invidio.us' in direct_url:
+                                    if 'invidious.snopyta.org' in direct_url:
                                         entry['url'] = normalize_url_path(direct_url)
                                     try:
                                         _file_size = await av_utils.media_size(direct_url, http_headers=http_headers)
@@ -948,7 +965,7 @@ async def _on_message(message, log, is_group):
                             elif (_file_size <= TG_MAX_FILE_SIZE) or cut_time_start is not None or cmd == 'z':
                                 chosen_format = entry
                                 direct_url = chosen_format['url']
-                                if 'invidio.us' in direct_url:
+                                if 'invidious.snopyta.org' in direct_url:
                                     chosen_format['url'] = normalize_url_path(direct_url)
                                 if audio_mode == True and not (chosen_format['ext'] == 'mp3'):
                                     ffmpeg_av = await av_source.FFMpegAV.create(chosen_format,
@@ -1054,7 +1071,7 @@ async def _on_message(message, log, is_group):
                                 # info = await av_utils.av_info(chosen_format['url'],
                                 #                               use_m3u8=('m3u8' in chosen_format['protocol']))
                                 info = await av_utils.av_info(chosen_format['url'], http_headers=http_headers)
-                                duration = int(float(info['format'].get('duration', 0)))
+                                duration = int(float(info.get('format', {}).get('duration', 0)))
                             else:
                                 duration = int(chosen_format['duration']) if 'duration' not in entry else int(
                                     entry['duration'])
@@ -1088,9 +1105,14 @@ async def _on_message(message, log, is_group):
                                 if _av_ext == 'mp3' or _av_ext == 'm4a' or _av_ext == 'ogg' or format_name == 'mp3' or format_name == 'ogg':
                                     audio_mode = True
                             except KeyError:
-                                width = 0
-                                height = 0
-                                duration = 0
+                                try:
+                                    width = chosen_format.get('width', 0)
+                                    height = chosen_format.get('height', 0)
+                                    duration = int(float(chosen_format.get('duration', 0)))
+                                except:
+                                    width = 0
+                                    height = 0
+                                    duration = 0
                                 format_name = ''
                         else:
                             width, height, duration = chosen_format['width'], chosen_format['height'], \
@@ -1302,7 +1324,10 @@ async def _on_message(message, log, is_group):
                         if is_group and user.settings.get('addlink', 1):
                             chat_username = message['chat']['username']
                             if chat_username is None:
-                                link = f'https://t.me/ytbdownbot'
+                                if str(chat_id).startswith('-100'):
+                                    link = f'https://t.me/c/{str(chat_id)[4:]}/{msg_id}'
+                                else:
+                                    link = f'https://t.me/ytbdownbot'
                             else:
                                 link = f'https://t.me/{chat_username}/{msg_id}'
                             caption = '['+caption+']' + f'({link})'
@@ -1323,7 +1348,8 @@ async def _on_message(message, log, is_group):
                                                        force_document=force_document,
                                                        supports_streaming=False if ffmpeg_av is not None else True,
                                                        thumb=_thumb,
-                                                       reply_to=msg_id if not is_group else None)
+                                                       reply_to=msg_id if not is_group or user.settings.get('force_reply', 0) else None,
+                                                       silent=True if is_group else False)
                             except AuthKeyDuplicatedError as e:
                                 if not is_group:
                                     await client.send_message(chat_id, 'INTERNAL ERROR: try again')
@@ -1353,7 +1379,7 @@ async def _on_message(message, log, is_group):
                 if recover_playlist_index is None:
                     break
     finally:
-        if not is_group:
+        if not is_group or user.settings.get('nonprivate_action', 0):
             await action.__aexit__()
 
 
@@ -1387,7 +1413,7 @@ TG_MAX_PARALLEL_CONNECTIONS = 20
 TG_CONNECTIONS_COUNT = 0
 MAX_STORAGE_SIZE = int(os.getenv('STORAGE_SIZE', 0)) * 1024 * 1024
 STORAGE_SIZE = MAX_STORAGE_SIZE
-
+YT_TOO_MANY_REQUEST = False
 
 async def shutdown():
     await tg_client_shutdown()
